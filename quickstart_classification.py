@@ -22,32 +22,34 @@ import matplotlib.pyplot as plt
 import argparse
 
 parser = argparse.ArgumentParser()
-parser.add_argument('--dataset', help="the dataset to train on, can be"\
-           +"mnist, fasionmnist, cifar10, ...",type=str, default='mnist')
-parser.add_argument('--model', help="the model to use: cnn or resnet",
-                      type=str,choices=['cnn','resnet'], default='cnn')
-parser.add_argument("--data_augmentation", help="using data augmentation",
-                     type=sknet.utils.str2bool,default='0')
+parser.add_argument('--dataset', type=str, choices=['mnist', 'fashionmnist',
+                    'svhn', 'cifar10', 'cifar100'], default='mnist')
+parser.add_argument('--model', type=str, choices=['cnn','smallresnet',
+                    'largeresnet'], default='cnn')
+parser.add_argument("--data_augmentation", type=int, default=0)
+parser.add_argument("--parameter", help="parameter", type=float, default=0)
 
-args              = parser.parse_args()
-DATASET           = args.dataset
-MODEL             = args.model
+args = parser.parse_args()
+DATASET = args.dataset
+MODEL = args.model
 DATA_AUGMENTATION = args.data_augmentation
+PARAMETER = args.parameter
+
 # Data Loading
-#-------------
-if DATASET=='mnist':
+# -------------
+if DATASET == 'mnist':
     dataset = sknet.dataset.load_mnist()
-elif DATASET=='fashionmnist':
+elif DATASET == 'fashionmnist':
     dataset = sknet.dataset.load_fashonmnist()
-elif DATASET=='cifar10':
+elif DATASET == 'cifar10':
     dataset = sknet.dataset.load_cifar10()
-elif DATASET=='cifar100':
+elif DATASET == 'cifar100':
     dataset = sknet.dataset.load_cifar100()
-elif DATASET=='svhn':
+elif DATASET == 'svhn':
     dataset = sknet.dataset.load_svhn()
 
 if "valid_set" not in dataset.sets:
-    dataset.split_set("train_set","valid_set",0.15)
+    dataset.split_set("train_set", "valid_set", 0.15)
 
 standardize = sknet.dataset.Standardize().fit(dataset['images/train_set'])
 dataset['images/train_set'] = \
@@ -57,31 +59,48 @@ dataset['images/test_set'] = \
 dataset['images/valid_set'] = \
                         standardize.transform(dataset['images/valid_set'])
 
-dataset.create_placeholders(batch_size=32,
-        iterators_dict={'train_set':BatchIterator("random_see_all"),
-                        'valid_set':BatchIterator('continuous'),
-                        'test_set':BatchIterator('continuous')},device="/cpu:0")
+
+# create the unsupervised set
+dataset.split_set('train_set','utrain_sets'
+perm = np.random.permutation(dataset['images/train_set'].shape[0])
+dataset['uimages/train_set'] = dataset['images/train_set'][perm[:-100]]
+dataset['ulabels/train_set'] = dataset['labels/train_set'][perm[:-100]]
+dataset['images/train_set'] = dataset['images/train_set'][perm[-100:]]
+dataset['labels/train_set'] = dataset['labels/train_set'][perm[-100:]]
+
+
+iterator = BatchIterator(32, {'train_set': 'random_see_all',
+                         'test_set': 'continuous', 'valid_set': 'continuous'})
+
+dataset.create_placeholders(iterator, device="/cpu:0")
 
 # Create Network
-#---------------
+# --------------
 
-dnn       = sknet.Network(name='simple_model')
-
+dnn = sknet.Network(name='simple_model')
+images = tf.concat([dnn.images, dnn.uimages], 0)
 if DATA_AUGMENTATION:
-    dnn.append(ops.RandomAxisReverse(dataset.images,axis=[-1]))
-    dnn.append(ops.RandomCrop(dnn[-1],(28,28),seed=10))
+    dnn.append(ops.RandomAxisReverse(images, axis=[-1]))
+    dnn.append(ops.RandomCrop(dnn[-1], (28, 28), seed=10))
 else:
-    dnn.append(dataset.images)
+    dnn.append(images)
 
-if MODEL=='cnn':
-    sknet.networks.ConvLarge(dnn,dataset.n_classes)
-elif MODEL=='resnet':
-    sknet.networks.Resnet(dnn,dataset.n_classes,D=4,W=1)
+if MODEL == 'cnn':
+    sknet.networks.ConvLarge(dnn, dataset.n_classes)
+elif MODEL == 'smallresnet':
+    sknet.networks.Resnet(dnn, dataset.n_classes, D=2, W=1)
+elif MODEL == 'largeresnet':
+    sknet.networks.Resnet(dnn, dataset.n_classes, D=4, W=2)
 
 prediction = dnn[-1]
 
-loss = sknet.losses.crossentropy_logits(p=dataset.labels,q=prediction)
-accu = sknet.losses.accuracy(dataset.labels,prediction)
+reconstruction = tf.gradients(prediction,images)[0]
+loss_recons = sknet.losses.MSE(reconstruction,images)
+loss_classif = sknet.losses.crossentropy_logits(p=dataset.labels,
+                                                q=prediction[:32])
+accu = sknet.losses.StreamingAccuracy(dataset.labels, prediction[:32])
+uaccu = sknet.losses.StreamingAccuracy(dataset.ulabels, prediction[32:])
+
 
 B         = dataset.N_BATCH('train_set')
 lr        = sknet.schedules.PiecewiseConstant(0.05,
