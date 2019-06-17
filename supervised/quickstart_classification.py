@@ -4,7 +4,6 @@ import argparse
 
 sys.path.insert(0, "../../Sknet")
 import sknet
-from sknet.dataset import BatchIterator
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', type=str, choices=['mnist', 'fashionmnist',
@@ -37,77 +36,71 @@ if "valid_set" not in dataset.sets:
     dataset.split_set("train_set", "valid_set", 0.15)
 
 standardize = sknet.dataset.Standardize().fit(dataset['images/train_set'])
-dataset['images/train_set'] = \
-                        standardize.transform(dataset['images/train_set'])
-dataset['images/test_set'] = \
-                        standardize.transform(dataset['images/test_set'])
-dataset['images/valid_set'] = \
-                        standardize.transform(dataset['images/valid_set'])
+standardize.transform(dataset['images/train_set'], inplace=True)
+standardize.transform(dataset['images/test_set'], inplace=True)
+standardize.transform(dataset['images/valid_set'], inplace=True)
 
-iterator = BatchIterator(32, {'train_set': 'random_see_all',
-                         'test_set': 'continuous', 'valid_set': 'continuous'})
-
-dataset.create_placeholders(iterator, device="/cpu:0")
+dataset.create_placeholders(32, {'train_set': 'random_see_all',
+                                 'test_set': 'continuous',
+                                 'valid_set': 'continuous'}, device="/cpu:0")
 
 # Network
 # --------------
 dnn = sknet.Network(name='simple_model')
-if DATA_AUGMENTATION:
-    dnn.append(sknet.ops.RandomAxisReverse(dataset.images, axis=[-1]))
-    image_shape = dnn[-1].shape.as_list()[-2:]
-    crop_shape = (image_shape[0]-4, image_shape[1]-4)
-    dnn.append(sknet.ops.RandomCrop(dnn[-1], crop_shape, seed=10))
-    images = dnn[-1]
-else:
-    dnn.append(dataset.images)
-    images = dnn.images
+dnn.append(sknet.ops.RandomAxisReverse(dataset.images, axis=[-1]))
+image_shape = dnn[-1].shape.as_list()[-2:]
+crop_shape = (image_shape[0]-4, image_shape[1]-4)
+dnn.append(sknet.ops.RandomCrop(dnn[-1], crop_shape, seed=10))
+
+images = dnn[-1]
 
 if MODEL == 'cnn':
     sknet.networks.ConvLarge(dnn, dataset.n_classes)
 elif MODEL == 'smallresnet':
-    sknet.networks.Resnet(dnn, dataset.n_classes, D=2, W=1)
+    sknet.networks.Resnet(dnn, dataset.n_classes, D=4, W=1)
 elif MODEL == 'largeresnet':
-    sknet.networks.Resnet(dnn, dataset.n_classes, D=4, W=2)
+    sknet.networks.Resnet(dnn, dataset.n_classes, D=8, W=2)
 
 prediction = dnn[-1]
 
 reconstruction = tf.gradients(dnn[-3], images)[0]
-loss_recons = sknet.losses.MSE(reconstruction, images)
+loss_recons = sknet.losses.squared_error(reconstruction, images)
 loss_classif = sknet.losses.crossentropy_logits(p=dataset.labels,
                                                 q=prediction)
-test_accu = sknet.losses.StreamingAccuracy(dataset.labels, prediction)
-test_recons = sknet.losses.StreamingMean(loss_recons)
-test_classif = sknet.losses.StreamingMean(loss_classif)
+test_accu = sknet.losses.streaming_mean(sknet.losses.accuracy(dataset.labels,
+                                                              prediction))
+test_recons = sknet.losses.streaming_mean(loss_recons)
+test_classif = sknet.losses.streaming_mean(loss_classif)
 
 B = dataset.N('train_set')//32
-lr = sknet.schedules.PiecewiseConstant(0.005, {75*B: 0.002, 125*B: 0.0005})
+lr = sknet.schedules.PiecewiseConstant(0.001, {90*B: 0.0005, 160*B: 0.0001})
 optimizer = sknet.optimizers.Adam(loss_classif+PARAMETER*loss_recons,
                                   dnn.variables(trainable=True), lr)
-minimizer = tf.group(optimizer.updates+dnn.updates)
+minimizer = tf.group(*optimizer.updates, *dnn.updates)
 reset_op = tf.group(optimizer.reset_variables_op, dnn.reset_variables_op)
 
 # Workers
 # ---------
-train_w = sknet.Worker(name='minimizer', context='train_set',
-                       op=[minimizer, loss_recons, loss_classif],
-                       deterministic=False, period=[1, 100, 100], verbose=2)
+period = sknet.dataset.BatchPeriod(1000)
+train = sknet.Worker(minimizer, loss_recons=loss_recons,
+                     images=(dataset.images, period),
+                     reconstructions=(reconstruction, period),
+                     loss_classif=loss_classif, context='train_set',
+                     deterministic=False)
 
-valid_w = sknet.Worker(name='accu', context='valid_set',
-                       op=[test_accu, test_recons, test_classif],
-                       deterministic=True, verbose=1)
+valid = sknet.Worker(loss_recons=loss_recons, loss_classif=loss_classif,
+                     context='valid_set', deterministic=True)
 
-test_w = sknet.Worker(name='accu', context='test_set',
-                      op=[test_accu, test_recons, test_classif],
-                      deterministic=True, verbose=1)
+test = sknet.Worker(loss_recons=loss_recons, loss_classif=loss_classif,
+                    images=(dataset.images, period),
+                    reconstructions=(reconstruction, period),
+                    context='test_set', deterministic=True)
 
 path = '/mnt/drive1/rbalSpace/GradientInversion/supervised/'
+workplace = sknet.utils.Workplace(dataset)
 
 for i in range(10):
-    filename = 'supervised_classif_{}_{}_{}_{}_run{}'.format(DATA_AUGMENTATION,
-                                                             DATASET, MODEL,
-                                                             PARAMETER, i)
-    queue = sknet.Queue((train_w, valid_w, test_w), filename=path+filename)
-    workplace = sknet.utils.Workplace(dnn, dataset=dataset)
-    workplace.execute_queue(queue, repeat=150)
+    filename = '{}_{}_{}_run{}'.format(DATASET, MODEL, PARAMETER, i)
+    queue = sknet.Queue((train, valid, test), filename=path+filename)
+    workplace.execute_queue(queue, deter_func=dnn.deter_dict, repeat=200)
     workplace.session.run(reset_op)
-
